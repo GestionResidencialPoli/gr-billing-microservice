@@ -1,0 +1,192 @@
+import json
+import os
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+from uuid import uuid4
+
+import jwt
+import pika
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import select, text
+
+import app.main as billing
+
+
+@pytest.fixture(autouse=True)
+def clean_database():
+    assert "_test_db" in os.environ["DATABASE_URL"]
+    assert billing.BILLING_EVENTS_EXCHANGE.endswith(".test.events")
+    with billing.SessionLocal() as db:
+        db.execute(
+            text(
+                "TRUNCATE financial_parameters, billable_apartments, generations, idempotency_keys, outbox_events, scheduled_runs RESTART IDENTITY CASCADE"
+            )
+        )
+        db.add(
+            billing.FinancialParameter(
+                base_value=Decimal("300000.00"),
+                monthly_late_rate=Decimal("0.025"),
+                due_days=10,
+                effective_from=date(2025, 1, 1),
+            )
+        )
+        db.commit()
+
+
+def client(role: str = "ADMINISTRACION", uid: int = 1) -> TestClient:
+    result = TestClient(billing.app)
+    token = jwt.encode(
+        {"uid": uid, "roles": [role], "exp": datetime.now(UTC) + timedelta(hours=1)},
+        billing.JWT_SECRET,
+        algorithm="HS256",
+    )
+    result.cookies.set("access_token", token)
+    result.cookies.set("XSRF-TOKEN", "test-csrf")
+    return result
+
+
+def headers(key: str | None = None) -> dict:
+    result = {"X-XSRF-TOKEN": "test-csrf"}
+    if key:
+        result["Idempotency-Key"] = key
+    return result
+
+
+def previous_month() -> date:
+    return (billing.business_today().replace(day=1) - timedelta(days=1)).replace(day=1)
+
+
+def billable(monkeypatch):
+    monkeypatch.setattr(
+        billing,
+        "billable_from_directory",
+        lambda: [{"id": 101, "torre": "A", "numero": "101", "activo": True, "coeficienteCopropiedad": 0.5}],
+    )
+    period = previous_month()
+    response = client().post(f"/api/v1/finanzas/cobros/generar?periodo={period:%Y-%m}", headers=headers())
+    assert response.status_code == 202, response.text
+    assert response.json()["payload"]["status"] == "EN_COLA"
+    assert billing.process_generation_jobs() == 1
+    return period
+
+
+def test_generation_runs_in_bounded_batches_and_exposes_progress(monkeypatch):
+    rows = [
+        {"id": apartment_id, "torre": "A", "numero": str(apartment_id), "activo": True, "coeficienteCopropiedad": 0.5}
+        for apartment_id in range(1, 206)
+    ]
+    monkeypatch.setattr(billing, "billable_from_directory", lambda: rows)
+    period = previous_month()
+    response = client().post(f"/api/v1/finanzas/cobros/generar?periodo={period:%Y-%m}", headers=headers())
+    assert response.status_code == 202
+    generation_id = response.json()["payload"]["generacionId"]
+    assert billing.process_generation_jobs(max_jobs=1) == 1
+    progress = client().get(f"/api/v1/finanzas/cobros/generaciones/{generation_id}")
+    assert progress.json()["payload"]["status"] == "EN_PROCESO"
+    assert progress.json()["payload"]["processed"] == 100
+    assert billing.process_generation_jobs(max_jobs=1) == 1
+    assert billing.process_generation_jobs(max_jobs=1) == 1
+    completed = client().get(f"/api/v1/finanzas/cobros/generaciones/{generation_id}").json()["payload"]
+    assert completed["status"] == "COMPLETADA"
+    assert completed["generated"] == completed["total"] == 205
+
+
+def test_generation_payment_idempotency_and_reversal(monkeypatch):
+    period = billable(monkeypatch)
+    admin = client()
+    repeat = admin.post(f"/api/v1/finanzas/cobros/generar?periodo={period:%Y-%m}", headers=headers())
+    assert repeat.status_code == 202
+    with billing.SessionLocal() as db:
+        assert db.scalar(select(billing.Charge.value)) == Decimal("150000.00")
+        assert db.scalar(select(billing.Charge.id).order_by(billing.Charge.id.desc())) == 1
+    body = {
+        "apartment_id": 101,
+        "value": "150000.00",
+        "paid_at": billing.business_today().isoformat(),
+        "method": "TRANSFERENCIA",
+    }
+    key = str(uuid4())
+    first = admin.post("/api/v1/finanzas/pagos", json=body, headers=headers(key))
+    second = admin.post("/api/v1/finanzas/pagos", json=body, headers=headers(key))
+    assert first.status_code == second.status_code == 201
+    assert first.json() == second.json()
+    with billing.SessionLocal() as db:
+        assert db.scalar(select(billing.Payment.id).order_by(billing.Payment.id.desc())) == 1
+    reversal = admin.post("/api/v1/finanzas/pagos/1/reverso", json={"reason": "Pago duplicado"}, headers=headers())
+    assert reversal.status_code == 200, reversal.text
+    assert (
+        admin.post("/api/v1/finanzas/pagos/1/reverso", json={"reason": "Pago duplicado"}, headers=headers()).json()
+        == reversal.json()
+    )
+    account = admin.get("/api/v1/finanzas/estado-cuenta/101")
+    assert account.status_code == 200
+    assert account.json()["payload"]["saldoTotal"] == "150000.00"
+
+
+def test_interest_graphql_and_read_permissions(monkeypatch):
+    billable(monkeypatch)
+    admin = client()
+    period = billing.business_today().replace(day=1)
+    first = admin.post("/api/v1/finanzas/intereses/aplicar", json={"periodo": f"{period:%Y-%m}"}, headers=headers())
+    assert first.status_code == 200, first.text
+    assert first.json()["payload"]["causados"] == 1
+    repeat = admin.post("/api/v1/finanzas/intereses/aplicar", json={"periodo": f"{period:%Y-%m}"}, headers=headers())
+    assert repeat.json()["payload"]["causados"] == 0
+    graphql = admin.post(
+        "/api/v1/finanzas/graphql", json={"query": "{ cartera { totalPendiente apartamentos { apartamentoId } } }"}
+    )
+    assert graphql.status_code == 200, graphql.text
+    assert graphql.json()["data"]["cartera"]["totalPendiente"] == "153750.00"
+    assert client("VIGILANTE").get("/api/v1/finanzas/cartera").status_code == 403
+    payment = {
+        "apartment_id": 101,
+        "value": "100.00",
+        "paid_at": billing.business_today().isoformat(),
+        "method": "TRANSFERENCIA",
+    }
+    assert (
+        admin.post("/api/v1/finanzas/pagos", json=payment, headers={"Idempotency-Key": str(uuid4())}).status_code == 403
+    )
+
+
+def test_proof_review_and_finance_event(monkeypatch):
+    billable(monkeypatch)
+    monkeypatch.setattr(
+        billing, "internal_get", lambda path, params=None: {"apartment": {"id": 101, "tipoResidente": "PROPIETARIO"}}
+    )
+    resident = client("RESIDENTE", 9)
+    key = str(uuid4())
+    data = {
+        "valorDeclarado": "150000.00",
+        "fechaTransferencia": billing.business_today().isoformat(),
+        "banco": "Banco de prueba",
+        "referencia": "REF-001",
+    }
+    files = {"archivo": ("prueba.pdf", b"%PDF-1.4\nprueba local", "application/pdf")}
+    response = resident.post("/api/v1/finanzas/comprobantes", data=data, files=files, headers=headers(key))
+    assert response.status_code == 201, response.text
+    assert response.json()["payload"]["estado"] == "EN_REVISION"
+    assert (
+        resident.post("/api/v1/finanzas/comprobantes", data=data, files=files, headers=headers(key)).json()
+        == response.json()
+    )
+    approved = client().patch("/api/v1/finanzas/comprobantes/1/aprobacion", headers=headers())
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["payload"]["pagoId"] == 1
+    connection = pika.BlockingConnection(pika.URLParameters(billing.RABBITMQ_URL))
+    try:
+        channel = connection.channel()
+        channel.exchange_declare(exchange=billing.BILLING_EVENTS_EXCHANGE, exchange_type="topic", durable=True)
+        queue = channel.queue_declare(queue="", exclusive=True).method.queue
+        channel.queue_bind(
+            queue=queue, exchange=billing.BILLING_EVENTS_EXCHANGE, routing_key="cartera.estado-actualizado"
+        )
+        billing.publish_outbox()
+        method, _, body = channel.basic_get(queue=queue, auto_ack=True)
+        assert method is not None
+        event = json.loads(body)
+        assert event["apartamentoId"] == 101
+        assert event["type"] == "cartera.estado-actualizado"
+    finally:
+        connection.close()

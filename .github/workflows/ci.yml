@@ -9,14 +9,38 @@ on:
 jobs:
   build-and-check:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: billing_test
+          POSTGRES_PASSWORD: billing_test
+          POSTGRES_DB: gr_billing_test_db
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U billing_test -d gr_billing_test_db"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+      rabbitmq:
+        image: rabbitmq:4-alpine
+        ports: [5672:5672]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      DATABASE_URL: postgresql+psycopg://billing_test:billing_test@localhost:5432/gr_billing_test_db
+      JWT_SECRET: local-development-secret-change-me
+      RABBITMQ_URL: amqp://guest:guest@localhost:5672
+      BILLING_EVENTS_EXCHANGE: gr.finance.test.events
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
           cache: pip
-      - run: pip install -r requirements.txt
+      - run: pip install -r requirements-dev.txt
       - run: python -m compileall -q app migrations
+      - run: alembic upgrade head
+      - run: pytest -q tests
       - run: docker build -t gr-billing-microservice:ci .
 
   release:
