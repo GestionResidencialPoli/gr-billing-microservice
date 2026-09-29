@@ -8,7 +8,7 @@ import jwt
 import pika
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 import app.main as billing
 
@@ -190,3 +190,82 @@ def test_proof_review_and_finance_event(monkeypatch):
         assert event["type"] == "cartera.estado-actualizado"
     finally:
         connection.close()
+
+
+def test_paid_charge_receipt_is_a_pdf_and_reuses_its_number(monkeypatch):
+    billable(monkeypatch)
+    admin = client()
+    payment = admin.post(
+        "/api/v1/finanzas/pagos",
+        json={
+            "apartment_id": 101,
+            "value": "150000.00",
+            "paid_at": billing.business_today().isoformat(),
+            "method": "TRANSFERENCIA",
+        },
+        headers=headers(str(uuid4())),
+    )
+    assert payment.status_code == 201, payment.text
+    with billing.SessionLocal() as db:
+        charge_id = db.scalar(select(billing.Charge.id))
+
+    first = admin.get(f"/api/v1/finanzas/cobros/{charge_id}/recibo")
+    second = admin.get(f"/api/v1/finanzas/cobros/{charge_id}/recibo")
+    assert first.status_code == second.status_code == 200
+    assert first.headers["content-type"] == "application/pdf"
+    assert first.content.startswith(b"%PDF-")
+    assert second.content.startswith(b"%PDF-")
+    assert second.headers["content-disposition"] == first.headers["content-disposition"]
+    with billing.SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(billing.Receipt)) == 1
+
+
+def test_finance_reports_export_expected_formats_and_require_admin(monkeypatch):
+    billable(monkeypatch)
+    admin = client()
+    cutoff = billing.business_today().isoformat()
+    reports = {
+        "/api/v1/finanzas/reportes/cartera.csv": ("text/csv", b"apartamentoId"),
+        "/api/v1/finanzas/reportes/cartera.pdf": ("application/pdf", b"%PDF-"),
+        f"/api/v1/finanzas/reportes/recaudo.csv?desde=2026-01-01&hasta={cutoff}": ("text/csv", b"pagoId"),
+        f"/api/v1/finanzas/reportes/comprobantes.csv?desde=2026-01-01&hasta={cutoff}": (
+            "text/csv",
+            b"comprobanteId",
+        ),
+    }
+    for path, (media_type, signature) in reports.items():
+        response = admin.get(path)
+        assert response.status_code == 200, response.text
+        assert response.headers["content-type"].startswith(media_type)
+        assert signature in response.content
+        assert client("VIGILANTE").get(path).status_code == 403
+
+
+def test_proof_upload_rejects_invalid_signature_and_files_over_five_mb(monkeypatch):
+    billable(monkeypatch)
+    monkeypatch.setattr(billing, "owner_apartment", lambda claims: 101)
+    resident = client("RESIDENTE", 9)
+    fields = {
+        "valorDeclarado": "150000.00",
+        "fechaTransferencia": billing.business_today().isoformat(),
+        "banco": "Banco de prueba",
+    }
+    invalid = resident.post(
+        "/api/v1/finanzas/comprobantes",
+        data={**fields, "referencia": "REF-BAD-SIGNATURE"},
+        files={"archivo": ("prueba.png", b"not a real image", "image/png")},
+        headers=headers(str(uuid4())),
+    )
+    oversized = resident.post(
+        "/api/v1/finanzas/comprobantes",
+        data={**fields, "referencia": "REF-TOO-LARGE"},
+        files={"archivo": ("prueba.pdf", b"x" * (5 * 1024 * 1024 + 1), "application/pdf")},
+        headers=headers(str(uuid4())),
+    )
+    assert invalid.status_code == 422
+    error = invalid.json()
+    error_code = (error.get("error") or {}).get("code") or (error.get("detail") or {}).get("code")
+    assert error_code == "ARCHIVO_INVALIDO"
+    assert oversized.status_code == 413
+    with billing.SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(billing.Proof)) == 0
