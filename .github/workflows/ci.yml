@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main, qa, develop]
+  pull_request:
+    branches: [main, qa, develop]
+
+jobs:
+  build-and-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m compileall -q app migrations
+      - run: docker build -t gr-billing-microservice:ci .
+
+  release:
+    needs: build-and-check
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    uses: GestionResidencialPoli/gr-infra/.github/workflows/build-push.yml@main
+    with:
+      service-name: gr-billing-microservice
+      compose-service: billing-microservice
+      migrate-target: false
+    secrets:
+      JENKINS_WEBHOOK_URL: ${{ secrets.JENKINS_WEBHOOK_URL }}
+      JENKINS_WEBHOOK_TOKEN: ${{ secrets.JENKINS_WEBHOOK_TOKEN }}

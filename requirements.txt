@@ -1,0 +1,9 @@
+alembic==1.16.5
+fastapi==0.116.1
+graphql-core==3.2.6
+PyJWT==2.10.1
+psycopg[binary]==3.2.10
+pydantic==2.11.7
+sqlalchemy==2.0.43
+strawberry-graphql[fastapi]==0.278.0
+uvicorn[standard]==0.35.0
