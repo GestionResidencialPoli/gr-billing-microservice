@@ -16,4 +16,4 @@ Servicio financiero en FastAPI con PostgreSQL, Alembic y GraphQL de solo lectura
 
 Configura las variables de `.env.example`, instala `requirements.txt` y ejecuta `alembic upgrade head` antes de `uvicorn app.main:app --port 4400`. La generación se encola en PostgreSQL y el worker procesa lotes de 100 apartamentos con hasta cuatro cálculos en paralelo por instancia. Los eventos `cartera.estado-actualizado` salen del outbox al exchange `gr.finance.events` con confirmación del broker.
 
-Para pruebas, instala `requirements-dev.txt`, usa una base cuyo nombre contenga `_test_db` y configura un exchange de RabbitMQ terminado en `.test.events`; las pruebas se niegan a truncar cualquier otra base o exchange.
+Para pruebas, instala `requirements-dev.txt`, usa una base cuyo nombre contenga `_test_db` y configura un exchange de RabbitMQ terminado en `.test.events`; luego ejecuta `alembic upgrade head` y `python -m pytest -q tests`. Las pruebas se niegan a truncar cualquier otra base o exchange.
