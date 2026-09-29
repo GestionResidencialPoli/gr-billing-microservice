@@ -1,5 +1,6 @@
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
@@ -190,6 +191,86 @@ def test_proof_review_and_finance_event(monkeypatch):
         assert event["type"] == "cartera.estado-actualizado"
     finally:
         connection.close()
+
+
+def test_outbox_retries_after_broker_restart(monkeypatch):
+    billable(monkeypatch)
+    real_connection = billing.pika.BlockingConnection
+
+    def unavailable(_parameters):
+        raise pika.exceptions.AMQPConnectionError()
+
+    monkeypatch.setattr(billing.pika, "BlockingConnection", unavailable)
+    with pytest.raises(pika.exceptions.AMQPConnectionError):
+        billing.publish_outbox()
+
+    with billing.SessionLocal() as db:
+        pending = db.scalar(
+            select(func.count())
+            .select_from(billing.OutboxEvent)
+            .where(billing.OutboxEvent.published_at.is_(None))
+        )
+        assert pending > 0
+
+    monkeypatch.setattr(billing.pika, "BlockingConnection", real_connection)
+    connection = real_connection(pika.URLParameters(billing.RABBITMQ_URL))
+    try:
+        channel = connection.channel()
+        channel.exchange_declare(
+            exchange=billing.BILLING_EVENTS_EXCHANGE,
+            exchange_type="topic",
+            durable=True,
+        )
+        queue = channel.queue_declare(queue="", exclusive=True).method.queue
+        channel.queue_bind(
+            queue=queue,
+            exchange=billing.BILLING_EVENTS_EXCHANGE,
+            routing_key="cartera.estado-actualizado",
+        )
+
+        billing.publish_outbox()
+
+        method, _, body = channel.basic_get(queue=queue, auto_ack=True)
+        assert method is not None
+        assert json.loads(body)["type"] == "cartera.estado-actualizado"
+        with billing.SessionLocal() as db:
+            pending = db.scalar(
+                select(func.count())
+                .select_from(billing.OutboxEvent)
+                .where(billing.OutboxEvent.published_at.is_(None))
+            )
+            assert pending == 0
+    finally:
+        connection.close()
+
+
+def test_concurrent_payments_apply_to_a_charge_without_overapplying(monkeypatch):
+    billable(monkeypatch)
+    payload = {
+        "apartment_id": 101,
+        "value": "100000.00",
+        "paid_at": billing.business_today().isoformat(),
+        "method": "TRANSFERENCIA",
+    }
+
+    def submit_payment(_index: int):
+        return client().post(
+            "/api/v1/finanzas/pagos",
+            json=payload,
+            headers=headers(str(uuid4())),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(submit_payment, range(2)))
+
+    assert [response.status_code for response in responses] == [201, 201]
+    with billing.SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(billing.Payment)) == 2
+        applied = db.scalar(select(func.sum(billing.PaymentApplication.value)))
+        assert applied == Decimal("150000.00")
+    statement = client().get("/api/v1/finanzas/estado-cuenta/101")
+    assert statement.status_code == 200
+    assert statement.json()["payload"]["saldoAFavor"] == "50000.00"
 
 
 def test_paid_charge_receipt_is_a_pdf_and_reuses_its_number(monkeypatch):
