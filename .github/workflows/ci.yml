@@ -40,7 +40,7 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - run: python -m compileall -q app migrations
       - run: alembic upgrade head
-      - run: pytest -q tests
+      - run: python -m pytest -q tests
       - run: docker build -t gr-billing-microservice:ci .
 
   release:
