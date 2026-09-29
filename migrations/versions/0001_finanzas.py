@@ -11,8 +11,6 @@ charge_status = sa.Enum("PENDIENTE", "PARCIAL", "PAGADO", name="charge_status")
 payment_method = sa.Enum("TRANSFERENCIA", "EFECTIVO", "CONSIGNACION", "OTRO", name="payment_method")
 
 def upgrade():
-    charge_status.create(op.get_bind(), checkfirst=True)
-    payment_method.create(op.get_bind(), checkfirst=True)
     op.create_table("financial_parameters", sa.Column("id", sa.Integer(), primary_key=True), sa.Column("base_value", sa.Numeric(15, 2), nullable=False), sa.Column("monthly_late_rate", sa.Numeric(8, 5), nullable=False), sa.Column("due_days", sa.Integer(), nullable=False), sa.Column("effective_from", sa.Date(), nullable=False))
     op.create_table("billable_apartments", sa.Column("id", sa.Integer(), primary_key=True), sa.Column("torre", sa.String(20), nullable=False), sa.Column("numero", sa.String(20), nullable=False), sa.Column("coefficient", sa.Numeric(8, 5)), sa.Column("active", sa.Boolean(), nullable=False, server_default=sa.true()))
     op.create_unique_constraint("uq_billable_apartment_torre_numero", "billable_apartments", ["torre", "numero"])
