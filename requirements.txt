@@ -1,4 +1,5 @@
 alembic==1.16.5
+cryptography==46.0.3
 fastapi==0.116.1
 graphql-core==3.2.6
 httpx==0.28.1

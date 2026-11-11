@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select, text
 
 import app.main as billing
+from app.jwe import encrypt_nested_jwt
 
 
 @pytest.fixture(autouse=True)
@@ -37,10 +38,13 @@ def clean_database():
 
 def client(role: str = "ADMINISTRACION", uid: int = 1) -> TestClient:
     result = TestClient(billing.app)
-    token = jwt.encode(
-        {"uid": uid, "roles": [role], "exp": datetime.now(UTC) + timedelta(hours=1)},
-        billing.JWT_SECRET,
-        algorithm="HS256",
+    token = encrypt_nested_jwt(
+        jwt.encode(
+            {"uid": uid, "roles": [role], "exp": datetime.now(UTC) + timedelta(hours=1)},
+            billing.JWT_SECRET,
+            algorithm="HS256",
+        ),
+        billing.JWT_ENCRYPTION_KEY,
     )
     result.cookies.set("access_token", token)
     result.cookies.set("XSRF-TOKEN", "test-csrf")
@@ -350,3 +354,15 @@ def test_proof_upload_rejects_invalid_signature_and_files_over_five_mb(monkeypat
     assert oversized.status_code == 413
     with billing.SessionLocal() as db:
         assert db.scalar(select(func.count()).select_from(billing.Proof)) == 0
+
+
+def test_a_signed_but_unencrypted_token_is_rejected():
+    plain = jwt.encode(
+        {"uid": 1, "roles": ["ADMINISTRACION"], "exp": datetime.now(UTC) + timedelta(hours=1)},
+        billing.JWT_SECRET,
+        algorithm="HS256",
+    )
+    result = TestClient(billing.app)
+    result.cookies.set("access_token", plain)
+
+    assert result.get("/api/v1/finanzas/cartera").status_code == 401
