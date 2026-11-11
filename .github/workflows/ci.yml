@@ -29,6 +29,7 @@ jobs:
     env:
       DATABASE_URL: postgresql+psycopg://billing_test:billing_test@localhost:5432/gr_billing_test_db
       JWT_SECRET: local-development-secret-change-me
+      JWT_ENCRYPTION_KEY: Y2xhdmUtZGUtcHJ1ZWJhcy1kZS0zMi1ieXRlcy1vayE
       RABBITMQ_URL: amqp://guest:guest@localhost:5672
       BILLING_EVENTS_EXCHANGE: gr.finance.test.events
     steps:
