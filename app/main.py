@@ -46,8 +46,11 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 from strawberry.extensions import DisableIntrospection, MaxTokensLimiter, QueryDepthLimiter
 from strawberry.fastapi import GraphQLRouter
 
+from app.jwe import InvalidEncryptedToken, decrypt_nested_jwt, load_encryption_key
+
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://gr_user:gr_password@localhost:5432/gr_billing_db")
 JWT_SECRET = os.getenv("JWT_SECRET", "local-development-secret-change-me")
+JWT_ENCRYPTION_KEY = load_encryption_key()
 USER_SERVICE_URL = os.getenv("USER_SERVICE_URL", "http://localhost:8080")
 INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://localhost:5672")
@@ -247,8 +250,8 @@ def claims_for(request: Request, required: str | None = None) -> dict:
     if not token:
         raise HTTPException(401, detail={"code": "NO_AUTENTICADO", "message": "Sesión requerida"})
     try:
-        claims = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-    except jwt.PyJWTError as exc:
+        claims = jwt.decode(decrypt_nested_jwt(token, JWT_ENCRYPTION_KEY), JWT_SECRET, algorithms=["HS256"])
+    except (jwt.PyJWTError, InvalidEncryptedToken) as exc:
         raise HTTPException(401, detail={"code": "NO_AUTENTICADO", "message": "Sesión inválida"}) from exc
     if required and required not in claims.get("roles", []):
         raise HTTPException(403, detail={"code": "SIN_PERMISOS", "message": "Rol insuficiente"})
