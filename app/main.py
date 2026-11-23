@@ -15,7 +15,6 @@ from threading import Event, Thread
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
-import httpx
 import jwt
 import pika
 import strawberry
@@ -46,13 +45,13 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 from strawberry.extensions import DisableIntrospection, MaxTokensLimiter, QueryDepthLimiter
 from strawberry.fastapi import GraphQLRouter
 
+from app.communications import CommunicationsError, communications_client
 from app.jwe import InvalidEncryptedToken, decrypt_nested_jwt, load_encryption_key
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://gr_user:gr_password@localhost:5432/gr_billing_db")
 JWT_SECRET = os.getenv("JWT_SECRET", "local-development-secret-change-me")
 JWT_ENCRYPTION_KEY = load_encryption_key()
-USER_SERVICE_URL = os.getenv("USER_SERVICE_URL", "http://localhost:8080")
-INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
+communications = communications_client("billing-microservice")
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://localhost:5672")
 BILLING_EVENTS_EXCHANGE = os.getenv("BILLING_EVENTS_EXCHANGE", "gr.finance.events")
 
@@ -274,25 +273,10 @@ def claim_user_id(claims: dict) -> int:
         ) from exc
 
 
-def internal_get(path: str, params: dict | None = None) -> dict:
-    if not INTERNAL_SERVICE_TOKEN:
-        raise HTTPException(
-            502,
-            detail={
-                "code": "DIRECTORIO_NO_DISPONIBLE",
-                "message": "Falta configurar la conexión interna con Identidad",
-            },
-        )
+def internal_request(action: str, payload: dict) -> dict:
     try:
-        response = httpx.get(
-            f"{USER_SERVICE_URL}{path}",
-            headers={"X-Internal-Token": INTERNAL_SERVICE_TOKEN},
-            params=params,
-            timeout=3.0,
-        )
-        response.raise_for_status()
-        return response.json()
-    except (httpx.HTTPError, ValueError) as exc:
+        return communications.request("user-microservice", action, payload)
+    except CommunicationsError as exc:
         raise HTTPException(
             502, detail={"code": "DIRECTORIO_NO_DISPONIBLE", "message": "No fue posible consultar Identidad"}
         ) from exc
@@ -301,7 +285,7 @@ def internal_get(path: str, params: dict | None = None) -> dict:
 def owner_apartment(claims: dict) -> int:
     if "RESIDENTE" not in claims.get("roles", []):
         raise HTTPException(403, detail={"code": "SIN_PERMISOS", "message": "Se requiere una sesión de propietario"})
-    user = internal_get(f"/api/v1/internal/users/{claim_user_id(claims)}")
+    user = internal_request("users.get", {"id": claim_user_id(claims)})
     apartment = user.get("apartment")
     if not apartment or apartment.get("tipoResidente") != "PROPIETARIO":
         raise HTTPException(
@@ -314,7 +298,7 @@ def billable_from_directory() -> list[dict]:
     rows: list[dict] = []
     page = 0
     while True:
-        result = internal_get("/api/v1/internal/apartments/facturables", {"page": page, "size": 500})
+        result = internal_request("apartments.billable", {"page": page, "size": 500})
         rows.extend(result["content"])
         if page + 1 >= result["totalPages"]:
             return rows
@@ -548,10 +532,12 @@ async def lifespan(_: FastAPI):
     stop_workers.clear()
     worker = Thread(target=background_worker, daemon=True)
     worker.start()
+    communications.start()
     try:
         yield
     finally:
         stop_workers.set()
+        communications.stop()
         worker.join(timeout=10)
 
 

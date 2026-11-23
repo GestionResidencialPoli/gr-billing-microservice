@@ -158,7 +158,7 @@ def test_interest_graphql_and_read_permissions(monkeypatch):
 def test_proof_review_and_finance_event(monkeypatch):
     billable(monkeypatch)
     monkeypatch.setattr(
-        billing, "internal_get", lambda path, params=None: {"apartment": {"id": 101, "tipoResidente": "PROPIETARIO"}}
+        billing, "internal_request", lambda action, payload: {"apartment": {"id": 101, "tipoResidente": "PROPIETARIO"}}
     )
     resident = client("RESIDENTE", 9)
     key = str(uuid4())
